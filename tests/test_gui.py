@@ -42,8 +42,8 @@ def test_background_extraction_worker(qtbot, tmp_path, make_rpa):
     game.mkdir(parents=True)
     executable = game.parent / "Game.exe"
     executable.touch()
-    make_rpa(game / "data.rpa", {"texts.yml": b"title: Hello\n"})
-    worker = ExtractionWorker(executable, tmp_path / "project", "portuguese_br")
+    make_rpa(game / "data.rpa", {"texts.yml": b"name: Hello\n"})
+    worker = ExtractionWorker(executable, tmp_path / "project", "portuguese_br", include_yaml=True)
     with qtbot.waitSignal(worker.succeeded, timeout=10000) as signal:
         worker.start()
     assert worker.wait(10000)

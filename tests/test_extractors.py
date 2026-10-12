@@ -46,7 +46,7 @@ screen title():
 
 def test_yaml_documents_aliases_types_and_comments():
     text = """# Keep this comment
-title: &greeting "Hello" # inline
+name: &greeting "Hello" # inline
 alias: *greeting
 enabled: true
 count: 42
@@ -63,7 +63,6 @@ items:
         "Hello",
         "First line\nSecond line\n",
         "World",
-        "42",
     ]
     for entry in entries:
         entry.update(
@@ -73,11 +72,11 @@ items:
         )
     exported = translated_yaml(text, entries)
     documents = list(YAML(typ="safe").load_all(exported))
-    assert documents[0]["title"] == documents[0]["alias"] == "Olá"
+    assert documents[0]["name"] == documents[0]["alias"] == "Olá"
     assert documents[0]["enabled"] is True
     assert documents[0]["count"] == 42
     assert documents[0]["description"] == "Primeira linha\nSegunda linha\n"
-    assert documents[1]["items"][0] == {"name": "Mundo", "id": "Quarenta e dois"}
+    assert documents[1]["items"][0] == {"name": "Mundo", "id": "42"}
     for comment in ("# Keep this comment", "# inline", "# block comment"):
         assert comment in exported
 

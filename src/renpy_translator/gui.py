@@ -35,8 +35,10 @@ from PySide6.QtWidgets import (
 )
 
 from .exporter import export_game
+from .google import MAX_BATCH, google_language, translate_google
 from .model import LANGUAGE, Entry, Project, export_csv, import_csv
 from .pipeline import create_project
+from .sdk import find_sdk, sdk_launcher
 
 
 class ExtractionWorker(QThread):
@@ -44,12 +46,23 @@ class ExtractionWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, executable: Path, destination: Path, language: str, parent=None):
+    def __init__(
+        self,
+        executable: Path,
+        destination: Path,
+        language: str,
+        parent=None,
+        *,
+        sdk_path: Path | None = None,
+        include_yaml: bool = False,
+    ):
         super().__init__(parent)
         self.executable = executable
         self.destination = destination
         self.language = language
         self.last_progress = 0.0
+        self.sdk_path = sdk_path
+        self.include_yaml = include_yaml
 
     def report(self, text: str):
         now = time.monotonic()
@@ -59,18 +72,62 @@ class ExtractionWorker(QThread):
 
     def run(self):
         try:
-            project = create_project(self.executable, self.destination, self.language, self.report)
+            project = create_project(
+                self.executable,
+                self.destination,
+                self.language,
+                self.report,
+                sdk_path=self.sdk_path,
+                include_yaml=self.include_yaml,
+            )
             self.succeeded.emit(project)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
+class GoogleWorker(QThread):
+    translated = Signal(str, str)
+    progress = Signal(int, int)
+    failed = Signal(str)
+    completed = Signal(int, int)
+
+    def __init__(self, entries: list[Entry], target: str, parent=None):
+        super().__init__(parent)
+        if not 1 <= len(entries) <= MAX_BATCH:
+            raise ValueError("Selecione de 1 a 25 textos para traduzir.")
+        self.items = [(entry.id, entry.source) for entry in entries]
+        self.target = target
+
+    def run(self):
+        success = 0
+        errors = 0
+        for index, (identifier, source) in enumerate(self.items, 1):
+            if self.isInterruptionRequested():
+                break
+            self.progress.emit(index, len(self.items))
+            try:
+                translated = translate_google(source, self.target)
+                self.translated.emit(identifier, translated)
+                success += 1
+            except Exception as error:
+                errors += 1
+                self.failed.emit(f"Texto {index}: {error}")
+                # Don't send the rest of the queue after a service/network failure.
+                break
+            if index < len(self.items):
+                self.msleep(400)
+        self.completed.emit(success, errors)
+
+
 class EntryModel(QAbstractTableModel):
-    headers = ["Estado", "Tipo", "Original", "Tradução", "Arquivo / linha"]
+    headers = ["Google", "Estado", "Tipo", "Original", "Tradução", "Arquivo / linha"]
+    marks_changed = Signal()
+    limit_reached = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.entries: list[Entry] = []
+        self.marked_ids: set[str] = set()
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.entries)
@@ -82,8 +139,11 @@ class EntryModel(QAbstractTableModel):
         if not index.isValid():
             return None
         entry = self.entries[index.row()]
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
+            return Qt.CheckState.Checked if entry.id in self.marked_ids else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DisplayRole:
             return [
+                "",
                 entry.status,
                 entry.kind,
                 entry.source.replace("\n", " ↵ "),
@@ -92,7 +152,7 @@ class EntryModel(QAbstractTableModel):
             ][index.column()]
         if role == Qt.ItemDataRole.ToolTipRole:
             return f"{entry.file}:{entry.line}\n{entry.context}\n{entry.source}"
-        if role == Qt.ItemDataRole.ForegroundRole and index.column() == 0:
+        if role == Qt.ItemDataRole.ForegroundRole and index.column() == 1:
             return QColor(
                 {
                     "Pendente": "#9caec3",
@@ -103,6 +163,31 @@ class EntryModel(QAbstractTableModel):
             )
         return None
 
+    def flags(self, index):
+        flags = super().flags(index)
+        return flags | Qt.ItemFlag.ItemIsUserCheckable if index.column() == 0 else flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if role != Qt.ItemDataRole.CheckStateRole or index.column() != 0:
+            return False
+        identifier = self.entries[index.row()].id
+        checked = value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value
+        if checked and identifier not in self.marked_ids and len(self.marked_ids) >= MAX_BATCH:
+            self.limit_reached.emit()
+            return False
+        if checked:
+            self.marked_ids.add(identifier)
+        else:
+            self.marked_ids.discard(identifier)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.marks_changed.emit()
+        return True
+
+    def clear_marks(self):
+        self.marked_ids.clear()
+        self.refresh()
+        self.marks_changed.emit()
+
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
             return self.headers[section]
@@ -111,11 +196,13 @@ class EntryModel(QAbstractTableModel):
     def set_project(self, project: Project):
         self.beginResetModel()
         self.entries = project.entries
+        self.marked_ids.clear()
         self.endResetModel()
+        self.marks_changed.emit()
 
     def refresh(self):
         if self.entries:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.entries) - 1, 4))
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.entries) - 1, 5))
 
 
 class EntryFilter(QSortFilterProxyModel):
@@ -177,6 +264,8 @@ class MainWindow(QMainWindow):
         self.project: Project | None = None
         self.current_entry: Entry | None = None
         self.worker: ExtractionWorker | None = None
+        self.google_worker: GoogleWorker | None = None
+        self.sdk_path: Path | None = None
         self.dirty = False
         self.loading_editor = False
         self.setWindowTitle("Tradutor Ren'Py")
@@ -200,6 +289,10 @@ class MainWindow(QMainWindow):
             ("import", "Importar CSV", self.import_translations, None),
             ("csv", "Exportar CSV", self.export_translations, None),
             ("export", "Gerar tradução", self.generate_translation, "Ctrl+E"),
+            ("sdk", "SDK Ren'Py", self.choose_sdk, None),
+            ("google", "Traduzir com Google", self.start_google, None),
+            ("clear", "Limpar marcações", self.clear_marks, None),
+            ("cancel", "Cancelar Google", self.cancel_google, None),
         ):
             action = QAction(label, self)
             action.triggered.connect(callback)
@@ -207,6 +300,7 @@ class MainWindow(QMainWindow):
                 action.setShortcut(QKeySequence(shortcut))
             toolbar.addAction(action)
             self.actions[name] = action
+        self.actions["cancel"].setEnabled(False)
 
     def _build_content(self):
         central = QWidget()
@@ -258,9 +352,9 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(36)
         header = self.table.horizontalHeader()
-        for column in (0, 1, 4):
+        for column in (0, 1, 2, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        for column in (2, 3):
+        for column in (3, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         self.table.selectionModel().currentChanged.connect(self.select_entry)
         splitter.addWidget(self.table)
@@ -287,8 +381,11 @@ class MainWindow(QMainWindow):
         self.validation.setTextFormat(Qt.TextFormat.PlainText)
         editor_layout.addWidget(self.validation)
         self.same_text = QCheckBox("Aplicar a textos Ren'Py iguais")
-        self.same_text.setChecked(True)
-        self.same_text.setToolTip("O catálogo Ren'Py usa a mesma tradução para textos idênticos.")
+        self.same_text.setChecked(False)
+        self.same_text.setToolTip(
+            "Os blocos do SDK permitem traduções diferentes por diálogo. "
+            "Marque para reutilizar o mesmo texto em outras ocorrências."
+        )
         editor_layout.addWidget(self.same_text)
         controls = QHBoxLayout()
         self.copy_button = QPushButton("Copiar original")
@@ -330,13 +427,19 @@ class MainWindow(QMainWindow):
         self.search.textChanged.connect(self.apply_filters)
         self.status_filter.currentTextChanged.connect(self.apply_filters)
         self.kind_filter.currentTextChanged.connect(self.apply_filters)
+        self.model.marks_changed.connect(self.update_google_controls)
+        self.model.limit_reached.connect(
+            lambda: QMessageBox.information(
+                self, "Limite de seleção", "Marque no máximo 25 textos para o Google Tradutor."
+            )
+        )
         find_action = QAction(self)
         find_action.setShortcut("Ctrl+F")
         find_action.triggered.connect(self.search.setFocus)
         self.addAction(find_action)
 
     def _set_project_controls(self, enabled: bool):
-        for name in ("save", "import", "csv", "export"):
+        for name in ("save", "import", "csv", "export", "clear"):
             self.actions[name].setEnabled(enabled)
         for widget in (
             self.search,
@@ -349,6 +452,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(enabled)
         if enabled:
             self.update_validation()
+        self.update_google_controls()
 
     def show_error(self, error):
         box = QMessageBox(self)
@@ -397,16 +501,45 @@ class MainWindow(QMainWindow):
         if not LANGUAGE.fullmatch(language):
             self.show_error("Use letras minúsculas, números e sublinhado; comece com uma letra.")
             return
+        answer = QMessageBox.question(
+            self,
+            "Incluir textos YAML?",
+            "Deseja incluir textos de arquivos .yml/.yaml?\n\n"
+            "Serão incluídos apenas name, description e condition quando o valor "
+            "de condition estiver entre aspas simples.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return
+        include_yaml = answer == QMessageBox.StandardButton.Yes
+        if self.sdk_path is None:
+            try:
+                self.sdk_path = find_sdk()
+            except ValueError as error:
+                self.show_error(error)
+            if self.sdk_path is None and not self.choose_sdk():
+                return
         executable = Path(selected)
         destination = unique_folder(Path(parent), f"{executable.stem}-traducao")
         self._set_project_controls(False)
         self.actions["game"].setEnabled(False)
         self.actions["open"].setEnabled(False)
+        self.actions["sdk"].setEnabled(False)
         self.table.setEnabled(False)
         self.progress.show()
         self.log.clear()
         self.log.appendPlainText(f"Criando projeto em {destination}")
-        self.worker = ExtractionWorker(executable, destination, language, self)
+        self.worker = ExtractionWorker(
+            executable,
+            destination,
+            language,
+            self,
+            sdk_path=self.sdk_path,
+            include_yaml=include_yaml,
+        )
         self.worker.progress.connect(self.log.appendPlainText)
         self.worker.succeeded.connect(self.load_project)
         self.worker.failed.connect(self.show_error)
@@ -417,6 +550,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.actions["game"].setEnabled(True)
         self.actions["open"].setEnabled(True)
+        self.actions["sdk"].setEnabled(True)
         self.table.setEnabled(True)
         self._set_project_controls(self.project is not None)
 
@@ -495,7 +629,10 @@ class MainWindow(QMainWindow):
             else ""
         )
         self.validation.setStyleSheet("color: #ffbd72;" if issues else "color: #67dfb4;")
-        self.review_button.setEnabled(bool(entry and entry.translation and not issues))
+        running = self.google_worker is not None and self.google_worker.isRunning()
+        self.review_button.setEnabled(
+            bool(entry and entry.translation and not issues and not running)
+        )
 
     def update_summary(self):
         if self.project is None:
@@ -609,6 +746,15 @@ class MainWindow(QMainWindow):
             self.show_error(exc)
 
     def closeEvent(self, event):
+        if self.google_worker is not None and self.google_worker.isRunning():
+            self.google_worker.requestInterruption()
+            QMessageBox.information(
+                self,
+                "Google em andamento",
+                "A fila foi cancelada. Aguarde a resposta atual antes de fechar.",
+            )
+            event.ignore()
+            return
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.information(
                 self, "Extração em andamento", "Aguarde a conclusão da extração antes de fechar."
@@ -618,6 +764,116 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    def choose_sdk(self) -> bool:
+        directory = QFileDialog.getExistingDirectory(
+            self, "Selecione a pasta do SDK oficial do Ren'Py"
+        )
+        if not directory:
+            return False
+        try:
+            sdk_launcher(Path(directory))
+            self.sdk_path = Path(directory)
+            self.log.appendPlainText(f"SDK selecionado: {directory}")
+            return True
+        except ValueError as error:
+            self.show_error(error)
+            return False
+
+    def clear_marks(self):
+        self.model.clear_marks()
+
+    def update_google_controls(self):
+        running = self.google_worker is not None and self.google_worker.isRunning()
+        extracting = self.worker is not None and self.worker.isRunning()
+        marked = len(self.model.marked_ids)
+        self.actions["google"].setEnabled(
+            bool(self.project and marked and not running and not extracting)
+        )
+        self.actions["google"].setText(f"Google ({marked}/25)")
+
+    def start_google(self):
+        if self.project is None:
+            return
+        entries = [entry for entry in self.project.entries if entry.id in self.model.marked_ids]
+        if not 1 <= len(entries) <= MAX_BATCH:
+            self.show_error("Marque de 1 a 25 textos na coluna Google.")
+            return
+        if any(entry.translation for entry in entries):
+            if (
+                QMessageBox.question(
+                    self,
+                    "Substituir traduções?",
+                    "Alguns textos marcados já têm tradução. Deseja substituí-la?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                return
+        target, accepted = QInputDialog.getText(
+            self,
+            "Idioma do Google",
+            "Código de destino (pt, en, es, zh-CN…):",
+            text=google_language(self.project.language),
+        )
+        if not accepted:
+            return
+        self.google_worker = GoogleWorker(entries, target, self)
+        self.google_worker.translated.connect(self.apply_google_result)
+        self.google_worker.progress.connect(self.google_progress)
+        self.google_worker.failed.connect(
+            lambda error: self.log.appendPlainText("Google: " + error)
+        )
+        self.google_worker.completed.connect(self.google_completed)
+        self.google_worker.finished.connect(self.google_finished)
+        self._set_project_controls(False)
+        for name in ("game", "open", "sdk", "google"):
+            self.actions[name].setEnabled(False)
+        self.table.setEnabled(False)
+        self.actions["cancel"].setEnabled(True)
+        self.progress.setRange(0, len(entries))
+        self.progress.setValue(0)
+        self.progress.show()
+        self.log.appendPlainText(f"Enviando {len(entries)} textos ao Google, um por vez.")
+        self.google_worker.start()
+
+    def google_progress(self, index: int, total: int):
+        self.progress.setValue(index - 1)
+        self.statusBar().showMessage(f"Google: traduzindo {index}/{total}…")
+
+    def apply_google_result(self, identifier: str, translated: str):
+        if self.project is None:
+            return
+        entry = next(entry for entry in self.project.entries if entry.id == identifier)
+        entry.update(translated, reviewed=False)
+        self.model.marked_ids.discard(identifier)
+        self.dirty = True
+        self.model.refresh()
+        if self.current_entry is entry:
+            self.select_entry(self.table.currentIndex())
+        self.update_summary()
+
+    def google_completed(self, success: int, errors: int):
+        self.log.appendPlainText(
+            f"Google: {success} traduzidos; {errors} erros. "
+            "Revise as traduções e salve o projeto. Textos não concluídos continuam marcados."
+        )
+
+    def google_finished(self):
+        self.progress.hide()
+        self.progress.setRange(0, 0)
+        self.actions["cancel"].setEnabled(False)
+        for name in ("game", "open", "sdk"):
+            self.actions[name].setEnabled(True)
+        self.table.setEnabled(True)
+        self._set_project_controls(self.project is not None)
+        self.update_google_controls()
+
+    def cancel_google(self):
+        if self.google_worker is not None:
+            self.google_worker.requestInterruption()
+            self.actions["cancel"].setEnabled(False)
+            self.log.appendPlainText("Cancelamento solicitado; aguardando a resposta atual.")
 
 
 def main():

@@ -1,0 +1,22 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      RENPY_SDK: /tmp/renpy-sdk/renpy-8.5.3-sdk
+      XDG_CACHE_HOME: /tmp/renpy-translator-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra dev
+      - run: .venv/bin/python scripts/install_sdk.py --destino /tmp/renpy-sdk
+      - run: .venv/bin/ruff check src tests scripts
+      - run: .venv/bin/ruff format --check src tests scripts
+      - run: .venv/bin/pytest -q

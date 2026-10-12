@@ -14,6 +14,12 @@ def main() -> int:
     extract.add_argument("exe", type=Path)
     extract.add_argument("--projeto", type=Path, required=True)
     extract.add_argument("--idioma", default="portuguese_br")
+    extract.add_argument("--sdk", type=Path, help="Pasta do SDK oficial do Ren'Py")
+    extract.add_argument(
+        "--incluir-yaml",
+        action="store_true",
+        help="Incluir name, description e condition entre aspas simples",
+    )
     export = commands.add_parser("exportar", help="Gerar arquivos para instalar no jogo")
     export.add_argument("projeto", type=Path)
     export.add_argument("--destino", type=Path, required=True)
@@ -26,7 +32,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "extrair":
-            project = create_project(args.exe, args.projeto, args.idioma, print)
+            project = create_project(
+                args.exe,
+                args.projeto,
+                args.idioma,
+                print,
+                sdk_path=args.sdk,
+                include_yaml=args.incluir_yaml,
+            )
             print(project.path)
             for warning in project.warnings:
                 print(f"Aviso: {warning}", file=sys.stderr)

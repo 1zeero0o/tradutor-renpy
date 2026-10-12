@@ -214,12 +214,16 @@ def extract_yaml(text: str, filename: str) -> list[Entry]:
         token.end_mark.index: token for token in yaml.scan(text) if isinstance(token, ScalarToken)
     }
 
-    def walk(node, context: str, ancestry: frozenset):
+    def walk(node, context: str, ancestry: frozenset, key_name: str = ""):
         if id(node) in ancestry:
             return
         ancestry = ancestry | {id(node)}
         if isinstance(node, ScalarNode):
             if node.tag != "tag:yaml.org,2002:str" or not node.value.strip():
+                return
+            if key_name not in {"name", "description"} and not (
+                key_name == "condition" and node.style == "'"
+            ):
                 return
             token = tokens[node.end_mark.index]
             span = (token.start_mark.index, token.end_mark.index)
@@ -241,11 +245,11 @@ def extract_yaml(text: str, filename: str) -> list[Entry]:
             )
         elif isinstance(node, SequenceNode):
             for index, child in enumerate(node.value):
-                walk(child, f"{context}[{index}]", ancestry)
+                walk(child, f"{context}[{index}]", ancestry, key_name)
         elif isinstance(node, MappingNode):
             for key, value in node.value:
                 name = key.value if isinstance(key, ScalarNode) else "<chave composta>"
-                walk(value, f"{context}.{name}", ancestry)
+                walk(value, f"{context}.{name}", ancestry, name)
 
     for index, document in enumerate(yaml.compose_all(text)):
         if document is not None:

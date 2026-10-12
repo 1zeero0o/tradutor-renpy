@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradutor-renpy"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extrator e editor desktop de traduções para jogos Ren'Py e arquivos YAML"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ renpy-translator-cli = "renpy_translator.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"renpy_translator" = ["sdk_driver.rpy"]
 "renpy_translator._vendor.unrpyc" = ["LICENSE", "ORIGIN.md"]
 
 [tool.pytest.ini_options]

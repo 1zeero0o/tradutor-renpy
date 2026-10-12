@@ -1,7 +1,20 @@
+import os
 import pickle
 import zlib
+from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="session")
+def sdk_path():
+    root = os.environ.get("RENPY_SDK")
+    if not root:
+        pytest.skip("Defina RENPY_SDK para executar os testes com o SDK real.")
+    from renpy_translator.sdk import sdk_launcher
+
+    sdk_launcher(Path(root))
+    return Path(root)
 
 
 @pytest.fixture

@@ -30,6 +30,8 @@ class Entry:
     start: int = 0
     end: int = 0
     fragment: str = ""
+    template_file: str = ""
+    identifier: str = ""
 
     @property
     def issues(self) -> list[str]:
@@ -72,6 +74,9 @@ class Project:
     sources: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     path: Path | None = field(default=None, repr=False)
+    templates: dict[str, str] = field(default_factory=dict)
+    sdk_version: str = ""
+    include_yaml: bool = False
 
     @property
     def counts(self) -> dict[str, int]:
@@ -89,13 +94,16 @@ class Project:
             raise ValueError("Idioma deve começar com uma letra e usar a–z, 0–9 e sublinhado.")
         payload = {
             "format": "renpy-translator",
-            "version": 1,
+            "version": 2,
             "game_name": self.game_name,
             "executable": self.executable,
             "language": self.language,
             "entries": [asdict(e) for e in self.entries],
             "sources": self.sources,
             "warnings": self.warnings,
+            "templates": self.templates,
+            "sdk_version": self.sdk_version,
+            "include_yaml": self.include_yaml,
         }
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -115,13 +123,15 @@ class Project:
     @classmethod
     def load(cls, path: Path) -> "Project":
         data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("format") != "renpy-translator" or data.get("version") != 1:
+        if data.get("format") != "renpy-translator" or data.get("version") not in {1, 2}:
             raise ValueError("Formato de projeto desconhecido.")
         entries = [Entry(**row) for row in data["entries"]]
         if len({e.id for e in entries}) != len(entries):
             raise ValueError("Projeto contém identificadores duplicados.")
         for entry in entries:
             relative_path(entry.file)
+            if entry.template_file:
+                relative_path(entry.template_file)
             if not isinstance(entry.source, str) or not isinstance(entry.translation, str):
                 raise ValueError("Texto inválido no projeto.")
             entry.update(entry.translation, entry.reviewed)
@@ -138,7 +148,14 @@ class Project:
             sources,
             data.get("warnings", []),
             path,
+            data.get("templates", {}),
+            data.get("sdk_version", ""),
+            data.get("include_yaml", False),
         )
+        for name, content in project.templates.items():
+            relative_path(name)
+            if not isinstance(content, str):
+                raise ValueError("Template Ren'Py inválido no projeto.")
         if not LANGUAGE.fullmatch(project.language):
             raise ValueError("Identificador de idioma inválido no projeto.")
         return project
