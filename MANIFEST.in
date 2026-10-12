@@ -1,0 +1,4 @@
+include README.md uv.lock
+recursive-include docs *.png
+recursive-include scripts *.py
+recursive-include tests *.py *.rpyc *.md
